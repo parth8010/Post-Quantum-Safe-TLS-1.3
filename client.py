@@ -10,22 +10,26 @@ sys.path.append(os.path.join(os.path.dirname(__file__), 'src'))
 from src.utils.logging import setup_logging
 from src.config import ClientConfig
 from src.tls.protocol.handshake import TLSHandshake
+from src.tls.protocol.hybrid_handshake import HybridTLSHandshake
 from src.tls.protocol.record_layer import TLSRecordManager
 from src.utils.logging import setup_logging
 from src.tls.protocol.handshake import TLSHandshake, ClientHello
 from src.tls.protocol.record_layer import TLSRecordManager
 
 class TLSClient:
-    def __init__(self, server_host='localhost', server_port=8443):
+    def __init__(self, server_host='localhost', server_port=8443, cipher_suite='classical'):
         self.server_host = server_host
         self.server_port = server_port
+        self.cipher_suite = cipher_suite  # 'classical' or 'hybrid'
         self.connected = False
         self.socket = None
         self.tls_handshake = None
-        self.record_manager = None  
+        self.record_manager_send = None
+        self.record_manager_recv = None
         setup_logging()
         self.logger = logging.getLogger("TLSClient")        
         self.config = ClientConfig()
+        self.logger.info(f"Using cipher suite: {cipher_suite.upper()}")
         
     def connect(self):
         """Connect to the TLS messaging server with TLS 1.3"""
@@ -40,11 +44,16 @@ class TLSClient:
             self.logger.info("Connected to server!")
             
             # Initialize TLS
-            self.tls_handshake = TLSHandshake(is_server=False)
+            if self.cipher_suite.lower() == 'hybrid':
+                self.tls_handshake = HybridTLSHandshake(is_server=False)
+                self.logger.info("Starting Hybrid PQ-Safe TLS 1.3 handshake...")
+            else:
+                self.tls_handshake = TLSHandshake(is_server=False)
             self.record_manager = TLSRecordManager(is_server=False)
             
             # Perform TLS handshake
-            self.logger.info("Starting TLS 1.3 handshake with server...")
+            mode_str = "🔐 Hybrid PQ-Safe (X25519+ML-KEM-768)" if self.cipher_suite.lower() == 'hybrid' else "🔒 Classical (X25519)"
+            self.logger.info(f"Starting TLS 1.3 handshake with {mode_str}...")
             if self._perform_tls_handshake():
                 self.logger.info("TLS handshake successful! Secure connection established.")
                 # Start message handling
@@ -75,9 +84,19 @@ class TLSClient:
             # Process ServerHello
             handshake_complete = self.tls_handshake.process_server_hello(server_response)
             
-            # Enable encryption after handshake
-            handshake_keys = self.tls_handshake.get_handshake_keys(is_server=False)
-            self.record_manager.enable_encryption("TLS_AES_256_GCM_SHA384", handshake_keys)
+            # Enable encryption - use correct keys for send vs receive
+            # Client sends with client traffic secret
+            client_write_keys = self.tls_handshake.get_handshake_keys(is_server=False)
+            # Client receives with server traffic secret
+            client_read_keys = self.tls_handshake.get_handshake_read_keys(is_server=False)
+            
+            # Create separate record managers for send and receive
+            self.record_manager_send = TLSRecordManager(is_server=False)
+            self.record_manager_recv = TLSRecordManager(is_server=False)
+            
+            self.record_manager_send.enable_encryption("TLS_AES_256_GCM_SHA384", client_write_keys)
+            self.record_manager_recv.enable_encryption("TLS_AES_256_GCM_SHA384", client_read_keys)
+            
             self.logger.info("Encryption enabled for handshake")
             
             return True
@@ -106,22 +125,15 @@ class TLSClient:
                 
                 buffer += data                
                 try:
-                    messages, buffer = self.record_manager.receive_data(buffer)
+                    messages, buffer = self.record_manager_recv.receive_data(buffer)
                     
                     for msg_type, msg_data in messages:
                         if msg_type == 'application_data':
-                            # This is decrypted text!
-                            message_text = msg_data.decode('utf-8')
-                            print(f"\n Server: {message_text}")
-                            print("You: ", end="", flush=True)
-                        else:
-                            print(f"\n Received {msg_type} message")
+                            message_text = msg_data.decode('utf-8', errors='ignore')
+                            print(f"\n{message_text}")
                             print("You: ", end="", flush=True)
                 except Exception as e:
-                    # If record processing fails, show raw data
-                    print(f"\n Received {len(data)} encrypted bytes")
-                    print(f"Hex: {data.hex()[:50]}...")
-                    print("You: ", end="", flush=True)
+                    self.logger.debug(f"Record processing: {e}")
                 
         except Exception as e:
             if self.connected:
@@ -130,23 +142,26 @@ class TLSClient:
             self.disconnect()
     
     def _send_messages(self):
-        """Send messages to server"""
+        """Send messages to server for relay"""
         try:
-            print("\n TLS Messaging Client Started!")
-            print("Type your messages and press Enter to send.")
-            print("Type 'quit' to exit.\n")
+            mode_str = "🔐 Hybrid PQ-Safe (X25519+ML-KEM-768)" if self.cipher_suite.lower() == 'hybrid' else "🔒 Classical (X25519)"
+            print(f"\nSecure Relay Chat - {mode_str}")
+            print("Messages sent will be relayed to other connected clients.\n")
             print("You: ", end="", flush=True)
             
             while self.connected:
-                # Get user input
                 message = input()
                 
                 if message.lower() == 'quit':
                     break
                 
-                encrypted_data = self.record_manager.send_application_data(message.encode())
+                if not message.strip():
+                    print("You: ", end="", flush=True)
+                    continue
+                
+                encrypted_data = self.record_manager_send.send_application_data(message.encode())
                 self.socket.send(encrypted_data)
-                self.logger.info(f" Sent encrypted message: {len(encrypted_data)} bytes")
+                self.logger.info(f"Sent: {message}")
                 
                 print("You: ", end="", flush=True)
                 
@@ -165,7 +180,12 @@ class TLSClient:
 
 def main():
     """Main client entry point"""
-    client = TLSClient()
+    cipher_suite = 'classical'
+    if len(sys.argv) > 1:
+        if sys.argv[1] == '--cipher-suite':
+            cipher_suite = sys.argv[2] if len(sys.argv) > 2 else 'classical'
+    
+    client = TLSClient(cipher_suite=cipher_suite)
     
     try:
         client.connect()
